@@ -1385,6 +1385,7 @@ function applyUiResults(p, q, results){
     if(fail===0 && q._moved && q._moved.length){
       q.untested=q.untested.filter(function(u){ return q._moved.indexOf(u)===-1; });
     }
+    if(fail===0) q.untested=dropCoveredUntested(p, q.untested, results);
   }
   if(fail===0 && pass>0 && q.verdict==="changes_requested"){
     var serious=0;
@@ -1395,6 +1396,44 @@ function applyUiResults(p, q, results){
   if(fail>0) q.summary=String(q.summary||"")+" [Browser UI tests: "+fail+" of "+(pass+fail)+" failed.]";
   else if(pass>0) q.summary=String(q.summary||"")+" [Browser UI tests: all "+pass+" passed.]";
   return q;
+}
+/* Patch 27.1: when every browser UI test passed, QA sometimes still lists the same features under
+   "Untested" (e.g. "Addition operation" next to a passed "Addition test"). Remove an untested item
+   only when ALL its meaningful words match words of passed test names; anything else stays. */
+var UNTESTED_STOP={"test":1,"tests":1,"operation":1,"operations":1,"function":1,"functions":1,"feature":1,"features":1,
+  "basic":1,"the":1,"and":1,"or":1,"of":1,"a":1,"an":1,"to":1,"in":1,"on":1,"with":1,"for":1,"button":1,"buttons":1,
+  "display":1,"works":1,"working":1,"correct":1,"correctly":1,"check":1,"app":1,"ui":1,"evaluation":1};
+function untestedWords(t, extraStop){
+  return String(t||"").toLowerCase().replace(/[_\-\/]/g," ").split(/[^a-z0-9]+/).filter(function(w){
+    return w.length>=3 && !UNTESTED_STOP[w] && !(extraStop && extraStop[w]);
+  });
+}
+function untestedWordMatch(a, b){
+  if(a===b) return true;
+  var n=Math.min(a.length, b.length, 4);
+  return n>=3 && a.slice(0,n)===b.slice(0,n) && (a.indexOf(b.slice(0,n))===0);
+}
+function dropCoveredUntested(p, untested, results){
+  try{
+    if(!Array.isArray(untested) || !untested.length) return untested;
+    var nameStop={}; untestedWords(p&&p.name).forEach(function(w){ nameStop[w]=1; });
+    var passed=[];
+    for(var i=0;i<results.length;i++){
+      var r=results[i]; if(!r || r.status!=="pass" || (r.test&&r.test.builtin)) continue;
+      passed=passed.concat(untestedWords(r.name, nameStop));
+    }
+    if(!passed.length) return untested;
+    return untested.filter(function(u){
+      if(/^UI test could not run/i.test(String(u))) return true;
+      var ws=untestedWords(u, nameStop); if(!ws.length) return true;
+      for(var k=0;k<ws.length;k++){
+        var hit=false;
+        for(var m=0;m<passed.length;m++){ if(untestedWordMatch(ws[k], passed[m])){ hit=true; break; } }
+        if(!hit) return true;   /* some part is not covered by a passed test: keep it */
+      }
+      return false;
+    });
+  }catch(err){ return untested; }
 }
 function evidenceText(ev){
   return ev==="ui" ? "browser UI tests ran (buttons clicked, results checked)"
