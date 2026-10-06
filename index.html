@@ -1012,7 +1012,8 @@ function parseEditBlocks(text){
   close();
   return (out.edits.length || out.wrong_tests.length) ? out : null;
 }
-var FILE_FORMAT=" Return PLAIN TEXT in this exact format (NOT JSON, no markdown fences, nothing else):\n"
+var FILE_FORMAT=" Never remove, shorten or simplify existing features, screens, fields or saved data; return every file COMPLETE to its last line (a shorter file is rejected by the factory)."
+  +" Return PLAIN TEXT in this exact format (NOT JSON, no markdown fences, nothing else):\n"
   +"@@SUMMARY one short line\n@@FILE index.html\n(the complete file, written exactly as code, no escaping)\n@@ENDFILE\n"
   +"Repeat @@FILE ... @@ENDFILE for each file you changed; files you did not change can be left out.";
 function parseFileBlocks(text){
@@ -1300,9 +1301,57 @@ function cleanUiTests(list){
     var t=list[i]; if(!t || typeof t!=="object") continue;
     var steps=Array.isArray(t.steps)?t.steps.slice(0,15):[], exp=Array.isArray(t.expect)?t.expect.slice(0,8):[];
     if(!exp.length && !steps.some(function(x){ return x && x["do"]==="expect"; })) continue;
-    out.push({ name:String(t.name||("Test "+(out.length+1))).slice(0,120), steps:steps, expect:exp });
+    var ct={ name:String(t.name||("Test "+(out.length+1))).slice(0,120), steps:steps, expect:exp };
+    fixArithExpect(ct);
+    out.push(ct);
   }
   return out;
+}
+/* Patch 27: QA sometimes guesses a calculator answer (e.g. 82 / 4 -> "21"). For simple
+   button tests (number, ONE operator, number, =) the factory computes the true result itself
+   and corrects a wrong numeric expectation, so a bad guess is never reported as an app bug. */
+function arithBtnVal(sel){
+  sel=String(sel||"");
+  var m=sel.match(/\[\s*(?:data-[\w-]+|value|aria-label)\s*=\s*['"]?([^'"\]]+?)['"]?\s*\]/i);
+  if(m) return m[1].trim();
+  if(/#(equal|equals|eq|calc|calculate|btn-?eq(uals?)?)\b/i.test(sel)) return "=";
+  if(/#(clear|btn-?clear|ac|btn-?c)\b/i.test(sel)) return "C";
+  return null;
+}
+function arithEval(a, op, b){
+  var x=parseFloat(a), y=parseFloat(b), r;
+  if(!isFinite(x)||!isFinite(y)) return null;
+  if(op==="+") r=x+y; else if(op==="-") r=x-y; else if(op==="*") r=x*y;
+  else if(op==="/"){ if(y===0) return null; r=x/y; } else return null;
+  if(!isFinite(r)) return null;
+  return String(parseFloat(r.toFixed(10)));
+}
+function fixArithExpect(t){
+  try{
+    var OPS={"+":"+","-":"-","\u2212":"-","*":"*","x":"*","X":"*","\u00d7":"*","/":"/","\u00f7":"/"};
+    var a="", op=null, b="", done=false;
+    for(var i=0;i<t.steps.length;i++){
+      var st=t.steps[i]; if(!st) continue;
+      if(st["do"]==="wait") continue;
+      if(st["do"]!=="click" || done) return;            /* typing, mid-test checks or clicks after "=": leave as is */
+      var v=arithBtnVal(st.sel); if(v==null) return;
+      if(/^[0-9]+$/.test(v) || v==="."){ if(op) b+=v; else a+=v; }
+      else if(OPS[v]){ if(op || !a) return; op=OPS[v]; }  /* one operator only: no chains, no precedence questions */
+      else if(v==="="){ done=true; }
+      else if(/^(c|ac|clear)$/i.test(v)){ a=""; op=null; b=""; }
+      else return;
+    }
+    if(!done || !op || !a || !b) return;
+    var want=arithEval(a, op, b); if(want==null) return;
+    for(var k=0;k<t.expect.length;k++){
+      var e=t.expect[k]; if(!e || e.text_contains==null) continue;
+      var got=String(e.text_contains).trim();
+      if(/^-?[0-9]+(\.[0-9]+)?$/.test(got) && parseFloat(got)!==parseFloat(want)){
+        e.text_contains=want;
+        t.name=t.name+" (expected value corrected: "+a+" "+op+" "+b+" = "+want+", QA wrote "+got+")";
+      }
+    }
+  }catch(err){ /* never block a test run over this check */ }
 }
 function runUiTests(p, tests){
   var html=buildPreviewHtml(p); tests=cleanUiTests(tests);
@@ -1378,7 +1427,7 @@ function runQA(p){
     +" ALSO write 3-"+UI_MAX_TESTS+" ui_tests. They are run for real in a browser against this exact code: each test starts on a freshly loaded page, "
     +"steps fill inputs / click buttons using CSS selectors that EXIST in the CODE (prefer #ids). Selectors must be plain CSS that document.querySelector accepts: never jQuery or Playwright extensions such as :contains(), :has-text() or :text(); to check that a list or grid shows some text, use text_contains on its container (e.g. #totalsGrid), which matches if ANY element there contains it. Then expect checks an element's visible text "
     +"(text_contains), visibility (visible:true|false) or count. Cover the main features and every USER-REPORTED ISSUE. Compute expected values exactly "
-    +"(e.g. bill 50 at 18% -> tip \"9.00\", total \"59.00\"). Keep expectations short and robust (numbers, not whole sentences)."
+    +"(e.g. bill 50 at 18% -> tip \"9.00\", total \"59.00\"). Keep expectations short and robust (numbers, not whole sentences). For arithmetic, choose operands whose result is exact and check the arithmetic twice (e.g. 84 / 4 = 21, but 82 / 4 = 20.5)."
     +" Be concise: summary max 3 sentences, bug detail/fix max 2 sentences each."
     +(styleIssue ? " NOTE: indentation was removed from the CODE below to save tokens; the CSS is included because an open issue is about styling \u2014 check that issue against the CSS." : " NOTE: CSS and indentation were removed from the CODE below to save tokens. Do NOT report missing or wrong styling; the 375px phone fit is checked automatically in a real browser. Judge structure, text and behaviour only.")
     +" RULES: expect[] is checked ONCE, after ALL steps (final state only) — never list several values for the same element there. "
@@ -1514,7 +1563,7 @@ function stepExec(id){
   setBusy("exec",true); render();
   runExecution(p).then(function(d){
     if(!d.configured){ setBusy("exec",false); alert("No sandbox configured. Add the runner URL in Settings."); render(); return; }
-    capExecLogs(d); p.exec=d; logActivity(p,"Runner", d.success?"Executed in sandbox — success.":"Executed in sandbox — failures (see logs).");
+    capExecLogs(d); p.exec=d; logActivity(p,"Runner", d.success?(execEvidence(p)==="syntax"?"Syntax check passed (behaviour not tested).":"Executed in sandbox — success."):"Executed in sandbox — failures (see logs).");
     upsertProject(p); setBusy("exec",false); render();
   }).catch(function(e){ setBusy("exec",false); alert(e.message); render(); });
 }
@@ -1944,7 +1993,37 @@ function classifyError(err){
 function invalidateBuildArtifacts(p){ p.exec=null; p.depAudit=null; }
 /* Replace the build, but first checkpoint the PREVIOUS build so it can be
    restored. Never snapshots the new build as if it were the old one. */
+/* Patch 26 (audit P0-2): shrink guard. An automated Builder result that is much smaller than the
+   current app, or that lost its closing </html>, almost always means features were dropped or the
+   output was cut off. Ask before replacing; Cancel (the safe default) keeps the current version. */
+var SHRINK_MIN_OLD=4000, SHRINK_RATIO=0.7;
+function buildBytes(b){ var n=0; ((b&&b.files)||[]).forEach(function(f){ n+=String(f.content||"").length; }); return n; }
+function lostHtmlEnd(oldB, newB){
+  var lost=[];
+  ((oldB&&oldB.files)||[]).forEach(function(of){
+    if(!/<\/html>\s*$/i.test(String(of.content||""))) return;
+    var nf=null; ((newB&&newB.files)||[]).forEach(function(x){ if(x.path===of.path) nf=x; });
+    if(nf && !/<\/html>\s*$/i.test(String(nf.content||""))) lost.push(of.path);
+  });
+  return lost;
+}
+function shrinkGuard(p, newBuild, note){
+  if(!p.build || !newBuild) return;
+  if(/^(restore of|import from|AI Engineer)/i.test(String(note||""))) return;
+  var oldN=buildBytes(p.build), newN=buildBytes(newBuild), cut=lostHtmlEnd(p.build, newBuild);
+  var shrank = oldN>=SHRINK_MIN_OLD && newN < oldN*SHRINK_RATIO;
+  if(!shrank && !cut.length) return;
+  var pct = oldN ? Math.round((1-newN/oldN)*100) : 0;
+  var why = cut.length ? ("the new "+cut.join(", ")+" is cut off (no closing </html>)")
+                       : ("the new version is "+pct+"% smaller ("+Math.round(oldN/1024)+" KB \u2192 "+Math.round(newN/1024)+" KB)");
+  var msg="Shrink guard ("+(note||"Builder")+"): "+why+". This usually means features were removed or the answer was cut off.\n\n"
+    +"Cancel = keep the current version (recommended).\nOK = replace anyway (only if you asked to make the app smaller).";
+  var ok=false; try{ ok=window.confirm(msg); }catch(e){ ok=false; }
+  logActivity(p,"Orchestrator","Shrink guard: "+why+" \u2014 "+(ok?"replaced after your OK.":"kept the current version."));
+  if(!ok){ var err=new Error("Kept the current version: "+why+". Nothing was replaced. Try again, or use the AI Engineer for a targeted change."); err.shrinkBlocked=true; throw err; }
+}
 function replaceBuild(p, newBuild, note){
+  shrinkGuard(p, newBuild, note);
   if(p.build){ snapshotBuild(p, "Previous build (before "+(note||"replacement")+")"); }
   p.build = newBuild;
   invalidateBuildArtifacts(p);
@@ -2004,7 +2083,7 @@ function wfExecute(p){
       return { skipped:true };
     }
     capExecLogs(d); p.exec=d;
-    logActivity(p,"Runner", d.success ? "Executed in sandbox — success (current build)." : "Executed in sandbox — tests FAILED (current build).");
+    logActivity(p,"Runner", d.success ? (execEvidence(p)==="syntax" ? "Syntax check passed — behaviour not tested (current build)." : "Executed in sandbox — success (current build).") : "Executed in sandbox — tests FAILED (current build).");
     upsertProject(p);
     return d;
   });
