@@ -883,6 +883,7 @@ function callGeminiCore(agentKey, system, user, ov){
     throw err;
   }).catch(function(err){ try{ if(err && typeof err==="object" && !err.agent) err.agent=agentKey; }catch(_){} throw err; });
 }
+var OA_LONG_OUT=32768;   /* Patch 48: output room for Builder/Engineer on OpenAI-compatible providers */
 function callModelCore(agentKey, system, user, forcedModel){
   var s = getSettings();
   if(!forcedModel){ var gov=agentOverride(agentKey); if(gov) return callGeminiCore(agentKey, system, user, gov); }
@@ -920,11 +921,26 @@ function callModelCore(agentKey, system, user, forcedModel){
     /* Patch 39 (cost): PM, Design and Security return structured JSON from a short brief, so low reasoning
        is enough and saves hidden reasoning tokens. Other agents keep their previous setting. */
     if(/gpt-oss/i.test(model)) oaBody.reasoning_effort = (agentKey==="builder" || agentKey==="qa" || agentKey==="engineer" || agentKey==="pm" || agentKey==="design" || agentKey==="sec") ? "low" : "medium";
-    makeCall = function(){ return fetchT(b + "/chat/completions", {
+    /* Patch 48: the OpenAI-compatible path sent NO output limit, so long Builder/Engineer answers were
+       capped by the provider's default and cut off (finish_reason "length"). Ask for the same room the
+       Gemini path already uses. If the provider rejects the parameter or its size (400/413), send the
+       request once more WITHOUT it (= the previous behaviour), so nothing gets worse. */
+    if(agentKey==="builder" || agentKey==="engineer") oaBody.max_completion_tokens = OA_LONG_OUT;
+    function oaSend(body){ return fetchT(b + "/chat/completions", {
       method:"POST",
       headers:{ "Content-Type":"application/json", "Authorization":"Bearer "+s.apiKey },
-      body: JSON.stringify(oaBody)
-    }, aiTimeoutMs(agentKey), model).then(function(res){ return handleOpenAI(res, model); }); };
+      body: JSON.stringify(body)
+    }, aiTimeoutMs(agentKey), model).then(function(res){ return handleOpenAI(res, model); }); }
+    makeCall = function(){
+      return oaSend(oaBody).catch(function(err){
+        if(oaBody.max_completion_tokens && err && !err.daily && (err.tooLarge || ((err.status===400 || err.status===413)
+           && /max_completion_tokens|max_tokens|maximum|too large|context|tokens per minute|TPM/i.test(String(err.message||""))))){
+          var b2={}; for(var k in oaBody){ if(k!=="max_completion_tokens") b2[k]=oaBody[k]; }
+          return oaSend(b2);
+        }
+        throw err;
+      });
+    };
   }
   return withRetry(makeCall, 3, agentKey).catch(function(err){
     /* Patch 39 (cost): a cut-off FULL app generation is not retried automatically: re-sending the whole
@@ -961,7 +977,7 @@ function callModelCore(agentKey, system, user, forcedModel){
    - Never blocks or breaks an agent: logging runs in the background, failures are ignored.
    - API keys / tokens are masked before saving; long text is cut short.
    - The table is append-only (database trigger), so the log cannot be edited later. */
-var AUDIT_PROMPT_VERSION="factory-p47", AUDIT_SYS_MAX=600, AUDIT_USR_MAX=1400, AUDIT_OUT_MAX=3000;
+var AUDIT_PROMPT_VERSION="factory-p48", AUDIT_SYS_MAX=600, AUDIT_USR_MAX=1400, AUDIT_OUT_MAX=3000;
 var audit={ q:[], timer:null, models:null, modelsAt:0, busy:false };
 function auditRedact(t){
   return String(t).replace(/\b(sk-[A-Za-z0-9_\-]{16,}|sk-ant-[A-Za-z0-9_\-]{16,}|gsk_[A-Za-z0-9]{20,}|AIza[0-9A-Za-z_\-]{30,}|AQ\.[0-9A-Za-z_\-]{20,}|ghp_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}|tvly-[A-Za-z0-9_\-]{16,}|eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,})/g, "[REDACTED]");
