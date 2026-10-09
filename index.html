@@ -826,10 +826,11 @@ function handleGemini(res, model){
     var tok=d.usageMetadata ? (d.usageMetadata.totalTokenCount||0) : 0;
     addTokens(tok); tokRecord(model, tok);
     if(c.finishReason==="MAX_TOKENS") throw new Error(TRUNC_MSG);
-    return { text:txt, tokens:tok, grounding:c.groundingMetadata||null };
+    var um=d.usageMetadata||{};
+    return { text:txt, tokens:tok, grounding:c.groundingMetadata||null, model:model, provider:"gemini", tin:um.promptTokenCount||0, tout:Math.max(0,tok-(um.promptTokenCount||0)) };
   });
 }
-function callGemini(agentKey, system, user, ov){
+function callGeminiCore(agentKey, system, user, ov){
   var model=ov.model, sys=system;
   function bodyJson(){
     var parts=[];
@@ -864,9 +865,9 @@ function callGemini(agentKey, system, user, ov){
     throw err;
   }).catch(function(err){ try{ if(err && typeof err==="object" && !err.agent) err.agent=agentKey; }catch(_){} throw err; });
 }
-function callModel(agentKey, system, user, forcedModel){
+function callModelCore(agentKey, system, user, forcedModel){
   var s = getSettings();
-  if(!forcedModel){ var gov=agentOverride(agentKey); if(gov) return callGemini(agentKey, system, user, gov); }
+  if(!forcedModel){ var gov=agentOverride(agentKey); if(gov) return callGeminiCore(agentKey, system, user, gov); }
   var model = forcedModel || modelFor(agentKey);
   var fb = String(s.fallbackModel||"").trim();
   /* Patch 9.1: if the provider just told us this model's daily budget is (almost) gone, go straight to the fallback. */
@@ -874,7 +875,7 @@ function callModel(agentKey, system, user, forcedModel){
     var qi=quotaInfo(model);
     if(qi.fromServer && qi.left!==null && qi.left < 6000){
       rlBanner("Daily limit on "+model+" \u2014 using fallback "+fb);
-      return callModel(agentKey, system, user, fb).then(function(r){ rlBanner(""); return r; }, function(e){ rlBanner(""); throw e; });
+      return callModelCore(agentKey, system, user, fb).then(function(r){ rlBanner(""); return r; }, function(e){ rlBanner(""); throw e; });
     }
   }
   if(!s.apiKey || !model){
@@ -922,10 +923,116 @@ function callModel(agentKey, system, user, forcedModel){
   }).catch(function(err){
     if(err && err.daily && !forcedModel && fb && fb!==model){
       rlBanner("Daily limit on "+model+" \u2014 switching to fallback "+fb);
-      return callModel(agentKey, system, user, fb).then(function(r){ rlBanner(""); return r; }, function(e){ rlBanner(""); throw e; });
+      return callModelCore(agentKey, system, user, fb).then(function(r){ rlBanner(""); return r; }, function(e){ rlBanner(""); throw e; });
     }
     throw err;
   }).catch(function(err){ try{ if(err && typeof err==="object" && !err.agent) err.agent=agentKey; }catch(_){} throw err; });
+}
+/* ---------- Patch 31: AI governance audit log ----------
+   Every agent's model call (PM, Design, Builder, QA, Security, Engineer, Research, custom) is
+   written to the Supabase table ai_audit_log: agent, model actually used (incl. fallback),
+   tokens in/out, cost, time, a short copy of the prompt and answer, and errors.
+   - Only when cloud sync is signed in; otherwise nothing is sent.
+   - Never blocks or breaks an agent: logging runs in the background, failures are ignored.
+   - API keys / tokens are masked before saving; long text is cut short.
+   - The table is append-only (database trigger), so the log cannot be edited later. */
+var AUDIT_PROMPT_VERSION="factory-p31", AUDIT_SYS_MAX=600, AUDIT_USR_MAX=1400, AUDIT_OUT_MAX=3000;
+var audit={ q:[], timer:null, models:null, modelsAt:0, busy:false };
+function auditRedact(t){
+  return String(t).replace(/\b(sk-[A-Za-z0-9_\-]{16,}|sk-ant-[A-Za-z0-9_\-]{16,}|gsk_[A-Za-z0-9]{20,}|AIza[0-9A-Za-z_\-]{30,}|AQ\.[0-9A-Za-z_\-]{20,}|ghp_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}|tvly-[A-Za-z0-9_\-]{16,}|eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,})/g, "[REDACTED]");
+}
+function auditCut(x, max){
+  var t = (x && typeof x==="object") ? (String(x.text||"")+((x.images&&x.images.length)?(" [+"+x.images.length+" image]"):"")) : String(x==null?"":x);
+  t=auditRedact(t);
+  return t.length>max ? (t.slice(0,max)+" \u2026[+"+(t.length-max)+" chars]") : t;
+}
+function auditErrKind(e){
+  if(!e) return "unknown";
+  if(e.daily) return "daily_limit";
+  if(e.status===429) return "rate_limit";
+  if(e.status===401||e.status===403) return "auth";
+  if(e.status===404) return "model_not_found";
+  if(e.tooLarge||e.status===413) return "too_large";
+  if(e.message===TRUNC_MSG) return "truncated";
+  if(e.status>=500) return "provider_down";
+  if(/Failed to fetch|NetworkError|offline/i.test(String(e.message||""))) return "network";
+  return "other";
+}
+function auditCall(agentKey, system, user, fn){
+  var t0=Date.now(), pid=state.projectId||null;
+  return fn().then(function(r){
+    auditPush({ agent:agentKey, ok:true, r:r, ms:Date.now()-t0, system:system, user:user, pid:pid });
+    return r;
+  }, function(e){
+    auditPush({ agent:agentKey, ok:false, err:e, ms:Date.now()-t0, system:system, user:user, pid:pid });
+    throw e;
+  });
+}
+function auditPush(x){
+  try{
+    if(!cloud || !cloud.client || !cloud.user) return;
+    var s=getSettings(), r=x.r||{}, e=x.err||null, tok=Number(r.tokens)||0;
+    var model=r.model || (e && e.model) || "";
+    var price=(r.provider==="main" && s.pricePerMillion>0) ? s.pricePerMillion : 0;
+    var p=x.pid ? getProject(x.pid) : null;
+    audit.q.push({
+      app_name:"ai-app-factory",
+      tenant_id:x.pid,
+      actor:String(x.agent||"unknown"),
+      action:"inference",
+      model_version:model||null,
+      prompt_version:AUDIT_PROMPT_VERSION,
+      input:"SYSTEM: "+auditCut(x.system, AUDIT_SYS_MAX)+"\n\nUSER: "+auditCut(x.user, AUDIT_USR_MAX),
+      output:x.ok ? auditCut(r.text, AUDIT_OUT_MAX) : null,
+      tokens_in:x.ok ? (Number(r.tin)||null) : null,
+      tokens_out:x.ok ? (Number(r.tout)||null) : null,
+      cost_usd:(x.ok && price) ? Math.round(tok/1e6*price*1e5)/1e5 : (x.ok && r.provider==="gemini" ? 0 : null),
+      latency_ms:x.ms,
+      flagged:!x.ok,
+      metadata:{ ok:!!x.ok, provider:r.provider||null, tokens_total:tok||null, project:p?(p.name||null):null,
+                 error:e?auditRedact(String(e.message||e)).slice(0,500):null, error_kind:e?auditErrKind(e):null,
+                 status:e&&e.status?e.status:null, user_email:cloud.user.email||null }
+    });
+    if(audit.q.length>300) audit.q=audit.q.slice(-300);
+    if(!audit.timer) audit.timer=setTimeout(auditFlush, 3000);
+  }catch(_){}
+}
+function auditModels(){
+  if(audit.models && Date.now()-audit.modelsAt<600000) return Promise.resolve(audit.models);
+  return cloud.client.from("ai_model_registry").select("id,model_name").eq("app_name","ai-app-factory").then(function(res){
+    var m={}; ((res && res.data)||[]).forEach(function(x){ m[x.model_name]=x.id; });
+    audit.models=m; audit.modelsAt=Date.now(); return m;
+  }, function(){ return audit.models||{}; });
+}
+function auditFlush(){
+  audit.timer=null;
+  if(audit.busy || !audit.q.length || !cloud || !cloud.client || !cloud.user) return Promise.resolve();
+  audit.busy=true;
+  var batch=audit.q.splice(0, 50);
+  return auditModels().then(function(m){
+    var rows=batch.map(function(x){
+      var o={}; for(var k in x){ if(k!=="_tries") o[k]=x[k]; }
+      o.model_id=(o.model_version && m[o.model_version]) || null;
+      return o;
+    });
+    return cloud.client.from("ai_audit_log").insert(rows);
+  }).then(function(res){
+    audit.busy=false;
+    if(res && res.error){
+      var again=batch.filter(function(x){ x._tries=(x._tries||0)+1; return x._tries<3; });
+      audit.q=again.concat(audit.q);
+      try{ console.warn("Audit log not saved:", res.error.message); }catch(_){}
+      if(!audit.timer) audit.timer=setTimeout(auditFlush, 20000);
+      return;
+    }
+    if(audit.q.length && !audit.timer) audit.timer=setTimeout(auditFlush, 3000);
+  }, function(){ audit.busy=false; audit.q=batch.concat(audit.q).slice(-300); if(!audit.timer) audit.timer=setTimeout(auditFlush, 20000); });
+}
+function callModel(agentKey, system, user, forcedModel){
+  return auditCall(agentKey, system, user, function(){ return callModelCore(agentKey, system, user, forcedModel); });
+}
+function callGemini(agentKey, system, user, ov){
+  return auditCall(agentKey, system, user, function(){ return callGeminiCore(agentKey, system, user, ov); });
 }
 var TRUNC_MSG = "Output truncated — the model ran out of output room (max_tokens). Use a model with larger output for the Builder, or ask for fewer/smaller files.";
 function providerError(res, raw, model){
@@ -948,7 +1055,7 @@ function handleOpenAI(res, model){
     var tok = d && d.usage ? (d.usage.total_tokens||0) : 0;
     addTokens(tok); tokRecord(model, tok);
     if(ch && ch.finish_reason==="length") throw new Error(TRUNC_MSG);
-    return { text:txt||"", tokens:tok };
+    return { text:txt||"", tokens:tok, model:model, provider:"main", tin:(d.usage&&d.usage.prompt_tokens)||0, tout:(d.usage&&d.usage.completion_tokens)||0 };
   });
 }
 function handleAnthropic(res, model){
@@ -960,7 +1067,7 @@ function handleAnthropic(res, model){
     var tok = d && d.usage ? ((d.usage.input_tokens||0)+(d.usage.output_tokens||0)) : 0;
     addTokens(tok); tokRecord(model, tok);
     if(d && d.stop_reason==="max_tokens") throw new Error(TRUNC_MSG);
-    return { text:txt, tokens:tok };
+    return { text:txt, tokens:tok, model:model, provider:"main", tin:(d.usage&&d.usage.input_tokens)||0, tout:(d.usage&&d.usage.output_tokens)||0 };
   });
 }
 function shortErr(status, raw){
@@ -2702,7 +2809,7 @@ function testGemini(){
   var m = (s.geminiModels && (s.geminiModels.qa || s.geminiModels.sec)) || "";
   if(!s.geminiKey || !m){ if(st) st.innerHTML='<span class="badge b-blocked">Missing</span> <span class="small muted">Add the Gemini key and a model name first.</span>'; return; }
   if(st) st.innerHTML='<span class="small muted"><span class="spin" style="border-color:rgba(15,42,74,.3);border-top-color:var(--navy)"></span>Testing Gemini\u2026</span>';
-  callGemini("qa","You are a connection tester. Reply with the single word: OK","Say OK",{ apiKey:s.geminiKey, model:String(m).replace(/^models\//,"") })
+  callGeminiCore("qa","You are a connection tester. Reply with the single word: OK","Say OK",{ apiKey:s.geminiKey, model:String(m).replace(/^models\//,"") })
     .then(function(r){ if(st) st.innerHTML='<span class="badge b-active">Gemini OK</span> <span class="small muted">'+esc((r.text||"").slice(0,40))+'</span>'; })
     .catch(function(e){ if(st) st.innerHTML='<span class="badge b-blocked">Failed</span> <span class="small muted">'+esc(e.message)+'</span>'; });
 }
@@ -5032,7 +5139,7 @@ function cloudCard(){
   return h;
 }
 try{
-  document.addEventListener("visibilitychange", function(){ if(document.visibilityState==="hidden") cloudFlush(); });
+  document.addEventListener("visibilitychange", function(){ if(document.visibilityState==="hidden"){ cloudFlush(); auditFlush(); } });
 }catch(e){}
 
 /* ---------- router ---------- */
