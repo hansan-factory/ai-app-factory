@@ -3210,14 +3210,27 @@ function ghPath(slug, filePath){
   if(fp.indexOf("..")!==-1 || !/^[A-Za-z0-9_.\/-]+$/.test(fp)) throw new Error("Unsafe file path: "+filePath);
   return slug+"/"+fp;
 }
-function ghPutFile(c, path, content, message, isB64){
+function ghPutFile(c, path, content, message, isB64, attempt){
+  /* Patch 34: GitHub can answer 409 (branch moved) or 422 (stale sha) when several files are
+     committed quickly one after another (e.g. the apps list right after a deploy).
+     Re-read the file's sha and try again, up to 3 times, with a short pause. */
+  attempt=attempt||1;
   var enc=path.split("/").map(encodeURIComponent).join("/");
-  return ghFetch(c, "GET", "/contents/"+enc+"?ref="+encodeURIComponent(c.branch)).then(function(r){
+  var b64=(isB64?String(content).replace(/\s+/g,""):b64utf8(content));
+  return ghFetch(c, "GET", "/contents/"+enc+"?ref="+encodeURIComponent(c.branch)+"&t="+Date.now()).then(function(r){
     if(!r.ok && r.status!==404) throw ghErr(r, "Reading "+path);
-    var body={ message:message, content:(isB64?String(content).replace(/\s+/g,""):b64utf8(content)), branch:c.branch };
+    var body={ message:message, content:b64, branch:c.branch };
     if(r.ok && r.data && r.data.sha) body.sha=r.data.sha;
     return ghFetch(c, "PUT", "/contents/"+enc, body).then(function(w){
-      if(!w.ok) throw ghErr(w, "Uploading "+path);
+      if(!w.ok){
+        var retry=(w.status===409) || (w.status===422 && /sha/i.test(String((w.data&&w.data.message)||w.raw||"")));
+        if(retry && attempt<3){
+          return new Promise(function(res){ setTimeout(res, 1500*attempt); }).then(function(){
+            return ghPutFile(c, path, b64, message, true, attempt+1);
+          });
+        }
+        throw ghErr(w, "Uploading "+path);
+      }
       return { path:path, commit:(w.data && w.data.commit && w.data.commit.sha)||"", created:!body.sha };
     });
   });
@@ -3537,7 +3550,7 @@ function stepDeploy(id){
       p.deploys.unshift(rec); if(p.deploys.length>20) p.deploys.length=20;
       upsertProject(p);
       if(!opts.index) return rec;
-      return ghUpdateIndex(c, "AI App Factory: update apps list").then(function(ix){
+      return new Promise(function(res){ setTimeout(res, 1200); }).then(function(){ return ghUpdateIndex(c, "AI App Factory: update apps list"); }).then(function(ix){
         if(ix && ix.skipped) idxNote=" Apps list page not updated: "+ix.skipped+".";
         return rec;
       }, function(e){ idxNote=" Apps list page not updated: "+e.message; return rec; });
