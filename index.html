@@ -228,6 +228,7 @@ function getProject(id){
   return null;
 }
 function upsertProject(p){
+  if(p && DELETED_IDS[p.id]) return;   /* Patch 47: never bring back a project deleted in this session */
   p.updatedAt = new Date().toISOString();
   cloudMarkDirty(p.id, p);
   var list = loadProjects(); var found=false;
@@ -272,7 +273,7 @@ function designSummary(p){
 }
 function logActivity(p, agent, msg){
   if(!p.activity) p.activity=[];
-  p.activity.unshift({ t:nowStr(), agent:agent, msg:msg });
+  p.activity.unshift({ t:nowStr(), d:new Date().toISOString(), agent:agent, msg:msg });
   if(p.activity.length>60) p.activity.length=60;
 }
 function extractJson(text){
@@ -748,6 +749,22 @@ function rlCountdown(ms, label){
     tick();
   });
 }
+/* Patch 46: every AI request gets a time limit, so a provider that never answers cannot leave a step
+   "running" forever. A timed-out request is NOT retried automatically (it would only wait again);
+   the step fails honestly and offers Retry. */
+function aiTimeoutMs(agentKey){ return (agentKey==="builder"||agentKey==="engineer") ? 180000 : 90000; }
+function fetchT(url, opts, ms, who){
+  var ctl=null, timer=null, timedOut=false;
+  try{ ctl=new AbortController(); }catch(e){ ctl=null; }
+  if(ctl){ opts=opts||{}; opts.signal=ctl.signal; timer=setTimeout(function(){ timedOut=true; try{ ctl.abort(); }catch(e){} }, ms); }
+  return fetch(url, opts).then(function(res){ if(timer) clearTimeout(timer); return res; }, function(err){
+    if(timer) clearTimeout(timer);
+    if(timedOut){ var e=new Error("No answer from "+(who||"the AI provider")+" within "+Math.round(ms/1000)+" s, so this step stopped (nothing was changed)."); e.timedOut=true; e.model=who||""; throw e; }
+    throw err;
+  });
+}
+/* Patch 46: only http(s) links are rendered as links (search results are untrusted input). */
+function safeUrl(u){ u=String(u||"").trim(); return /^https?:\/\//i.test(u) ? u : ""; }
 function withRetry(makeCall, tries, label){
   tries = tries || 3;
   var rlWaits = 0;
@@ -764,6 +781,7 @@ function withRetry(makeCall, tries, label){
         throw err;
       }
       if(err && err.tooLarge) throw err;
+      if(err && err.timedOut) throw err;
       var netErr = err && err.message && /load failed|failed to fetch|network|timeout/i.test(err.message);
       if((isTransient(st) || netErr) && n < tries){
         var wait = 900 * Math.pow(2, n-1);
@@ -849,11 +867,11 @@ function callGeminiCore(agentKey, system, user, ov){
     return JSON.stringify(body);
   }
   var makeCall=function(){
-    return fetch(GEMINI_BASE+"/models/"+encodeURIComponent(model)+":generateContent", {
+    return fetchT(GEMINI_BASE+"/models/"+encodeURIComponent(model)+":generateContent", {
       method:"POST",
       headers:{ "Content-Type":"application/json", "x-goog-api-key":ov.apiKey },
       body:bodyJson()
-    }).then(function(res){ return handleGemini(res, model); });
+    }, aiTimeoutMs(agentKey), model).then(function(res){ return handleGemini(res, model); });
   };
   return withRetry(makeCall, 3, agentKey).catch(function(err){
     if(err && err.message===TRUNC_MSG){
@@ -884,14 +902,14 @@ function callModelCore(agentKey, system, user, forcedModel){
   var makeCall;
   if(s.provider==="anthropic"){
     var abase = s.baseUrl && s.baseUrl.length ? s.baseUrl : "https://api.anthropic.com";
-    makeCall = function(){ return fetch(abase + "/v1/messages", {
+    makeCall = function(){ return fetchT(abase + "/v1/messages", {
       method:"POST",
       headers:{ "Content-Type":"application/json", "x-api-key":s.apiKey,
                 "anthropic-version":"2023-06-01",
                 "anthropic-dangerous-direct-browser-access":"true" },
       body: JSON.stringify({ model:model, max_tokens:(agentKey==="builder"?16000:(agentKey==="engineer"?12000:4000)), system:system,
                              messages:[{ role:"user", content:anthropicUserContent(user) }] })
-    }).then(function(res){ return handleAnthropic(res, model); }); };
+    }, aiTimeoutMs(agentKey), model).then(function(res){ return handleAnthropic(res, model); }); };
   } else {
     var b = s.baseUrl && s.baseUrl.length ? s.baseUrl : "https://api.openai.com/v1";
     var oaBody = { model:model,
@@ -899,14 +917,21 @@ function callModelCore(agentKey, system, user, forcedModel){
         temperature:0.4 };
     /* Reasoning models (gpt-oss) spend output tokens on hidden reasoning first.
        The Builder writes whole files, so keep its reasoning short to leave room for code. */
-    if(/gpt-oss/i.test(model)) oaBody.reasoning_effort = (agentKey==="builder" || agentKey==="qa" || agentKey==="engineer") ? "low" : "medium";
-    makeCall = function(){ return fetch(b + "/chat/completions", {
+    /* Patch 39 (cost): PM, Design and Security return structured JSON from a short brief, so low reasoning
+       is enough and saves hidden reasoning tokens. Other agents keep their previous setting. */
+    if(/gpt-oss/i.test(model)) oaBody.reasoning_effort = (agentKey==="builder" || agentKey==="qa" || agentKey==="engineer" || agentKey==="pm" || agentKey==="design" || agentKey==="sec") ? "low" : "medium";
+    makeCall = function(){ return fetchT(b + "/chat/completions", {
       method:"POST",
       headers:{ "Content-Type":"application/json", "Authorization":"Bearer "+s.apiKey },
       body: JSON.stringify(oaBody)
-    }).then(function(res){ return handleOpenAI(res, model); }); };
+    }, aiTimeoutMs(agentKey), model).then(function(res){ return handleOpenAI(res, model); }); };
   }
   return withRetry(makeCall, 3, agentKey).catch(function(err){
+    /* Patch 39 (cost): a cut-off FULL app generation is not retried automatically: re-sending the whole
+       prompt usually gets cut off again and doubles the tokens spent. Edits, QA and Engineer still retry once. */
+    if(agentKey==="builder" && err && err.message===TRUNC_MSG && /^You are the BUILDER agent\. Generate the actual, complete source code/.test(String(system||""))){
+      err.fullGenCut=true; throw err;
+    }
     if((agentKey==="builder" || agentKey==="qa" || agentKey==="engineer") && err && err.message===TRUNC_MSG){
       rlBanner((agentKey==="qa"?"QA":"Builder")+" output was cut off \u2014 retrying once with a shorter answer\u2026");
       try{
@@ -936,7 +961,7 @@ function callModelCore(agentKey, system, user, forcedModel){
    - Never blocks or breaks an agent: logging runs in the background, failures are ignored.
    - API keys / tokens are masked before saving; long text is cut short.
    - The table is append-only (database trigger), so the log cannot be edited later. */
-var AUDIT_PROMPT_VERSION="factory-p36", AUDIT_SYS_MAX=600, AUDIT_USR_MAX=1400, AUDIT_OUT_MAX=3000;
+var AUDIT_PROMPT_VERSION="factory-p47", AUDIT_SYS_MAX=600, AUDIT_USR_MAX=1400, AUDIT_OUT_MAX=3000;
 var audit={ q:[], timer:null, models:null, modelsAt:0, busy:false };
 function auditRedact(t){
   return String(t).replace(/\b(sk-[A-Za-z0-9_\-]{16,}|sk-ant-[A-Za-z0-9_\-]{16,}|gsk_[A-Za-z0-9]{20,}|AIza[0-9A-Za-z_\-]{30,}|AQ\.[0-9A-Za-z_\-]{20,}|ghp_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}|tvly-[A-Za-z0-9_\-]{16,}|eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,})/g, "[REDACTED]");
@@ -948,6 +973,7 @@ function auditCut(x, max){
 }
 function auditErrKind(e){
   if(!e) return "unknown";
+  if(e.timedOut) return "timeout";
   if(e.daily) return "daily_limit";
   if(e.status===429) return "rate_limit";
   if(e.status===401||e.status===403) return "auth";
@@ -1265,7 +1291,22 @@ function runDesign(p){
     return j;
   });
 }
+/* Patch 39 (cost): size guard. Long requirements with many screens/features usually exceed the free
+   model's output limit, and each failed full generation wastes thousands of tokens. Ask BEFORE calling. */
+var BUILD_SIZE_CHARS=1400, BUILD_SIZE_TASKS=12;
+function buildSizeCheck(p){
+  if(p.sizeOk) return;
+  var reqLen=String(p.description||"").length, tasks=(p.plan&&p.plan.tasks&&p.plan.tasks.length)||0;
+  if(reqLen<=BUILD_SIZE_CHARS && tasks<=BUILD_SIZE_TASKS) return;
+  var why=(reqLen>BUILD_SIZE_CHARS?("requirements are "+reqLen+" characters"):"")+(reqLen>BUILD_SIZE_CHARS&&tasks>BUILD_SIZE_TASKS?" and ":"")+(tasks>BUILD_SIZE_TASKS?("the plan has "+tasks+" tasks"):"");
+  var ok=false;
+  try{ ok=window.confirm("Size check: "+why+". An app this big is often cut off by the free model, and a failed build wastes many tokens.\n\nRecommended (Cancel): Edit the requirements to the core screens only (Phase 1), re-run the plan, then add features one at a time.\n\nOK = build the whole app anyway."); }catch(e){ ok=false; }
+  logActivity(p,"Orchestrator","Size check: "+why+" \u2014 "+(ok?"you chose to build anyway.":"build stopped before calling the model (no tokens used)."));
+  if(!ok){ var e2=new Error("Build stopped by the size check before any tokens were used. Edit the requirements to Phase 1 (core screens), re-run the plan, then Retry."); e2.sizeBlocked=true; throw e2; }
+  p.sizeOk=true;
+}
 function runBuilder(p){
+  try{ buildSizeCheck(p); }catch(e){ return Promise.reject(e); }
   var ctx = "";
   if(p.plan && p.plan.overview) ctx += "PLAN: "+p.plan.overview+"\n";
   ctx += designSummary(p);
@@ -1291,13 +1332,79 @@ function runBuilder(p){
 }
 
 /* ---------- Phase 2: QA, execution, fix-loop, checkpoints ---------- */
+/* Patch 41: diagnostic report. A plain-text summary of one project's state for troubleshooting:
+   workflow, errors, QA, security, runs, auto-fix, checkpoints, deploys and recent activity.
+   It contains NO app code and NO keys: settings are listed by name/host only, and every known secret
+   value plus anything that looks like a key is masked before the file is written. */
+function exportDiagnostics(id){
+  var p=getProject(id); if(!p){ alert("Project not found."); return; }
+  var s=getSettings(), gh=ghCfg(), L=[];
+  function host(u){ var m=String(u||"").match(/^https?:\/\/([^\/?#]+)/i); return m?m[1]:(u?"(custom)":"(none)"); }
+  function line(k,v){ L.push(k+": "+(v===undefined||v===null||v===""?"-":v)); }
+  function when(iso,t){ return iso?govWhen(iso):(t||""); }
+  L.push("AI APP FACTORY \u2014 DIAGNOSTIC REPORT"); line("Generated",new Date().toISOString()); line("Factory build",AUDIT_PROMPT_VERSION); L.push("");
+  L.push("== PROJECT"); line("Name",p.name); line("Id",p.id); line("Status",p.status); line("Phase",p.phase); line("Created",p.createdAt);
+  line("Requirements length",String(p.description||"").length+" chars"); line("Plan tasks",(p.plan&&p.plan.tasks&&p.plan.tasks.length)||0); line("Plan approved",!!(p.approvals&&p.approvals.plan)); L.push("");
+  L.push("== SETTINGS (no secrets)"); line("Provider",s.provider); line("Base URL host",host(s.baseUrl)); line("API key set",s.apiKey?"yes":"no");
+  line("Default model",s.defaultModel); line("Fallback model",s.fallbackModel); line("Agent models",JSON.stringify(s.agentModels||{}));
+  line("Gemini key set",s.geminiKey?"yes":"no"); line("Gemini models",JSON.stringify(s.geminiModels||{})); line("Sandbox",s.sandboxUrl?("configured, host "+host(s.sandboxUrl)):"not configured");
+  line("Stack mode",s.stackMode); line("GitHub deploy",ghReady(gh)?("configured ("+gh.owner+"/"+gh.repo+")"):"not configured"); line("Cloud sync",(typeof cloud!=="undefined"&&cloud&&cloud.user)?"signed in":"not signed in");
+  try{ line("Quota",quotaLine()); }catch(e){} L.push("");
+  var w=p.workflow; L.push("== WORKFLOW");
+  if(w){ line("Steps",(w.steps||[]).map(function(x){ return x.key+":"+x.status; }).join(", ")); line("Running",!!w.running); line("Failed step",w.failedStep); line("Error",w.error); line("Hint",w.errorHint); line("Awaiting approval",!!w.awaitingApproval); }
+  else L.push("(not started)"); L.push("");
+  var q=p.qa; L.push("== QA");
+  if(q){ line("Verdict",q.verdict); line("Evidence",evidenceText(q.evidence)); line("Summary",q.summary);
+    if(q.ui) line("Browser UI tests",q.ui.passed+" passed, "+q.ui.failed+" failed, "+q.ui.errors+" could not run"+((q.ui.results||[]).length?(" ["+q.ui.results.map(function(r){ return r.name+"="+r.status+(r.detail?(" ("+String(r.detail).slice(0,80)+")"):""); }).join("; ")+"]"):""));
+    (q.bugs||[]).forEach(function(b,i){ L.push("  bug "+(i+1)+" ["+b.severity+"] "+b.title+(b.fromUser?" (reported by you)":"")); });
+    (q.untested||[]).forEach(function(u){ L.push("  untested: "+u); }); }
+  else L.push("(no QA result for the current code)");
+  var ob=openUserBugs(p); if(ob.length) line("Open bugs you reported",ob.length); L.push("");
+  var sec=p.security; L.push("== SECURITY");
+  if(sec){ line("Risk",sec.risk_rating); (sec.findings||[]).forEach(function(f,i){ L.push("  finding "+(i+1)+" ["+(f.severity||"?")+"] "+(f.title||f.issue||"")); }); }
+  else L.push("(no security result for the current code)"); L.push("");
+  L.push("== EXECUTION"); line("Evidence",evidenceText(execEvidence(p)));
+  if(p.exec&&p.exec.configured){ line("Success",p.exec.success); (p.exec.results||[]).forEach(function(r){ L.push("  $ "+String(r.cmd||"").slice(0,120)+" (exit "+r.exitCode+") "+String(r.stderr||r.stdout||"").replace(/\s+/g," ").slice(-300)); }); }
+  L.push("");
+  L.push("== AUTO-FIX"); if(p.autofix){ line("Outcome",p.autofix.outcome); (p.autofix.rounds||[]).forEach(function(r){ L.push("  round "+r.n+": "+r.before+" -> "+r.after+" bug(s), verdict "+r.verdict+", runtime "+r.runtime+", ~"+r.tokens+" tokens"); }); } else L.push("(not run)");
+  line("Fix iterations used",(p.iteration||0)+"/"+MAX_ITER); L.push("");
+  L.push("== CURRENT CODE (no content)");
+  ((p.build&&p.build.files)||[]).forEach(function(f){ L.push("  "+f.path+" \u2014 "+String(f.content||"").length+" chars"); }); line("Code fingerprint",auditCodeHash(p)); L.push("");
+  L.push("== CHECKPOINTS"); (p.buildHistory||[]).forEach(function(h){ L.push("  v"+h.v+" \u00b7 "+when(h.at,h.ts)+" \u00b7 "+h.note+" \u00b7 "+snapQualityText(h.quality)+(snapIsGood(h.quality)?" \u00b7 GOOD":"")+(h.filesOmitted?" \u00b7 code on other device":"")); });
+  if(!(p.buildHistory||[]).length) L.push("(none)"); L.push("");
+  L.push("== DEPLOYS"); (p.deploys||[]).slice(0,5).forEach(function(d){ L.push("  "+(d.version||"")+" \u00b7 "+(d.url||"")+" \u00b7 commit "+(d.commit||"")+(d.warnings&&d.warnings.length?(" \u00b7 "+d.warnings.length+" warning(s)"):"")); });
+  if(!(p.deploys||[]).length) L.push("(none)"); L.push("");
+  L.push("== ACTIVITY (newest first)"); (p.activity||[]).forEach(function(a){ L.push("  "+when(a.d,a.t)+" "+a.agent+": "+a.msg); });
+  var txt=L.join("\n");
+  /* mask every known secret value, then anything that looks like a key */
+  var acc=acCfg(), secrets=[s.apiKey,s.geminiKey,s.sandboxSecret,s.tavilyKey,gh.token,acc.anon];
+  secrets.forEach(function(v){ v=String(v||""); if(v.length>=8) txt=txt.split(v).join("[REDACTED]"); });
+  txt=auditRedact(txt);
+  var nm=String(p.name||"project").replace(/[^a-z0-9]+/gi,"-").replace(/^-+|-+$/g,"").toLowerCase()||"project";
+  saveBlob(new Blob([txt],{ type:"text/plain" }), "diagnostics-"+nm+".txt");
+}
+function snapQuality(p){
+  if(!p.qa) return { reviewed:false, exec:execEvidence(p) };
+  var bugs=p.qa.bugs||[], hi=0;
+  for(var i=0;i<bugs.length;i++){ if(String(bugs[i].severity||"").toLowerCase()==="high") hi++; }
+  return { reviewed:true, verdict:p.qa.verdict||"?", bugs:bugs.length, high:hi, uiErr:(p.qa.ui&&p.qa.ui.errors)||0,
+           exec:execEvidence(p), sec:(p.security&&p.security.risk_rating)||null };
+}
+function snapIsGood(q){ return !!(q && q.reviewed && q.verdict==="pass" && q.exec!=="failed"); }
+function snapQualityText(q){
+  if(!q) return "quality not recorded (older checkpoint)";
+  if(!q.reviewed) return "not reviewed by QA"+(q.exec&&q.exec!=="none"?(" \u00b7 run: "+q.exec):"");
+  return "QA "+q.verdict+" \u00b7 "+q.bugs+" bug(s)"+(q.high?(" ("+q.high+" high)"):"")+(q.uiErr?(" \u00b7 "+q.uiErr+" test(s) not run"):"")
+    +" \u00b7 run: "+(q.exec||"none")+(q.sec?(" \u00b7 security: "+q.sec):"");
+}
 function snapshotBuild(p, note){
   if(!p.build) return;
   if(!p.buildHistory) p.buildHistory=[];
   var maxV=0;
   for(var i=0;i<p.buildHistory.length;i++){ var hv=Number(p.buildHistory[i].v)||0; if(hv>maxV) maxV=hv; }
   p.buildSeq=Math.max(Number(p.buildSeq)||0, maxV)+1;
-  p.buildHistory.unshift({ v:p.buildSeq, ts:nowStr(), note:note,
+  /* Patch 41: each checkpoint remembers WHEN it was made (date) and how good it was (QA, run, security, fingerprint). */
+  p.buildHistory.unshift({ v:p.buildSeq, ts:nowStr(), at:new Date().toISOString(), quality:snapQuality(p), hash:auditCodeHash(p), note:note,
     summary:(p.build.summary||""),
     files:JSON.parse(JSON.stringify(p.build.files||[])),
     run_commands:(p.build.run_commands||[]).slice(),
@@ -1320,6 +1427,10 @@ function defaultCommands(files){
 function runnerUrl(raw){
   var u=String(raw||"").trim();
   if(!/^https?:\/\//i.test(u)) return { error:"Sandbox runner URL must start with https:// (current value is not an absolute URL)." };
+  /* Patch 38 (audit): the runner secret travels in the request body, so plain http:// would expose it.
+     Only https:// is accepted (http://localhost stays allowed for local testing). */
+  if(/^http:\/\//i.test(u) && !/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?(\/|$)/i.test(u))
+    return { error:"Sandbox runner URL must use https:// (http:// would send the runner secret unencrypted)." };
   var m=u.match(/^(https?:\/\/[^\/?#]+)(\/[^?#]*)?(.*)$/i);
   if(!m) return { error:"Sandbox runner URL is not valid." };
   var path=(m[2]||"").replace(/\/+$/,"");
@@ -1333,8 +1444,14 @@ function runnerFetch(rawUrl, body){
   var r=runnerUrl(rawUrl);
   if(r.error) return Promise.reject(new Error(r.error));
   var origin=""; try{ origin=window.location.origin||""; }catch(e){}
-  return fetch(r.url, { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body) })
+  /* Patch 38 (audit): a stalled runner used to leave the step "running" forever. Abort after 150 s
+     (enough for a Render cold start plus the run) and report it as a timeout, never as success. */
+  var ctl=null, timer=null, timedOut=false;
+  try{ ctl=new AbortController(); timer=setTimeout(function(){ timedOut=true; try{ ctl.abort(); }catch(e){} }, 150000); }catch(e){ ctl=null; }
+  return fetch(r.url, { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body), signal:ctl?ctl.signal:undefined })
+    .then(function(res){ if(timer) clearTimeout(timer); return res; }, function(err){ if(timer) clearTimeout(timer); throw err; })
     .catch(function(err){
+      if(timedOut) throw new Error("Sandbox runner did not answer within 150 s, so the code was NOT executed. Check that the Render service is Live, then try again.");
       throw new Error("Sandbox runner unreachable from the browser (no readable response from "+r.url+"). "
         +"Most likely CORS: on Render set ALLOWED_ORIGIN to exactly "+(origin||"this app's origin")
         +" (no trailing slash), then redeploy. Also confirm the Render service is Live. "
@@ -1547,7 +1664,11 @@ function applyUiResults(p, q, results){
   }
   if(fail>0 && q.verdict==="pass") q.verdict="changes_requested";
   if(fail>0) q.summary=String(q.summary||"")+" [Browser UI tests: "+fail+" of "+(pass+fail)+" failed.]";
-  else if(pass>0) q.summary=String(q.summary||"")+" [Browser UI tests: all "+pass+" passed.]";
+  else if(pass>0) q.summary=String(q.summary||"")+" [Browser UI tests: all "+pass+" that ran passed.]";
+  if(err>0){
+    var nr=results.filter(function(r){ return r.status!=="pass" && r.status!=="fail"; }).map(function(r){ return r.name; });
+    q.summary=String(q.summary||"")+" [NOT VERIFIED: "+err+" UI test(s) could not run ("+nr.join(", ")+"), so those features were not tested in the browser. Check them in Preview.]";
+  }
   return q;
 }
 /* Patch 27.1: when every browser UI test passed, QA sometimes still lists the same features under
@@ -1795,6 +1916,8 @@ function markComplete(id){
   if(p.status==="completed"){ render(); return; }
   var ob=openUserBugs(p);
   if(ob.length){ alert(ob.length+" bug(s) you reported are still OPEN.\n\nTest each one in Preview and tap \"I tested it \u2014 it's fixed\" before completing."); return; }
+  var uiErr=(p.qa&&p.qa.ui&&p.qa.ui.errors)||0;
+  if(uiErr && !confirm(uiErr+" browser UI test(s) could not run, so those features were NOT tested.\n\nOnly continue if you checked them yourself in Preview. Mark complete anyway?")) return;
   p.status="completed"; p.phase="Completed"; logActivity(p,"You","Marked project complete."); upsertProject(p); render();
 }
 function rollbackBuild(id, ix){
@@ -1835,7 +1958,36 @@ function runAutoFixLoop(p, onProgress){
   AUTOFIX.cancel=false;
   p.autofix={ rounds:[], outcome:null, startedAt:nowStr() };
   var lastSig=bugSig(p.qa);
+  /* Patch 40: keep the best build. Every build that QA has reviewed is a candidate, scored by real
+     evidence first (a failed sandbox run is worst), then high-severity bugs, then all bugs. If auto-fix
+     ends without a pass, or a round breaks halfway, the best reviewed build is put back (with its QA),
+     so an unverified or worse replacement never stays as the current version. */
+  var best=null, cur=null, unverified=false;
+  function afScore(){
+    var bugs=(p.qa&&p.qa.bugs)||[], hi=0;
+    for(var i=0;i<bugs.length;i++){ if(String(bugs[i].severity||"").toLowerCase()==="high") hi++; }
+    var execFail=(p.exec&&p.exec.configured&&p.exec.success===false)?1:0;
+    return execFail*100000 + hi*100 + bugs.length;
+  }
+  function noteCandidate(label){
+    if(!p.build || !p.qa) return;
+    cur={ label:label, score:afScore(), bugs:((p.qa.bugs)||[]).length,
+          build:JSON.parse(JSON.stringify(p.build)), qa:JSON.parse(JSON.stringify(p.qa)), exec:p.exec?JSON.parse(JSON.stringify(p.exec)):null };
+    if(!best || cur.score<best.score) best=cur;
+    unverified=false;
+  }
+  function restoreBest(why){
+    if(!best || (!unverified && cur && cur.score<=best.score)) return "";
+    var fromTxt=unverified?"the unverified build":(cur?cur.label+" ("+cur.bugs+" bug(s))":"the current build");
+    snapshotBuild(p, "Auto-fix result set aside ("+why+")");
+    p.build=JSON.parse(JSON.stringify(best.build)); p.qa=JSON.parse(JSON.stringify(best.qa));
+    p.exec=best.exec?JSON.parse(JSON.stringify(best.exec)):null; p.security=null; p.depAudit=null;
+    unverified=false; cur=best;
+    var m="Restored the best reviewed build ("+best.label+", "+best.bugs+" bug(s)) instead of "+fromTxt+". The other version is saved as a checkpoint.";
+    return " "+m;
+  }
   function finish(outcome, msg){
+    if(outcome!=="pass" && outcome!=="not_needed") msg+=restoreBest(outcome);
     p.autofix.outcome=outcome; logActivity(p,"Auto-fix",msg); upsertProject(p); return outcome;
   }
   function round(){
@@ -1843,6 +1995,7 @@ function runAutoFixLoop(p, onProgress){
       onProgress("QA review");
       return runQA(p).then(function(q){ p.qa=q; upsertProject(p); lastSig=bugSig(q); return round(); });
     }
+    if(!best) noteCandidate("starting build");
     var n=p.autofix.rounds.length;
     var v=p.qa.verdict;
     var bugs=p.qa.bugs||[];
@@ -1857,6 +2010,7 @@ function runAutoFixLoop(p, onProgress){
     return runBuilderFix(p).then(function(j){
       replaceBuild(p, j, "Auto-fix round "+it);   /* checkpoints the previous build */
       p.qa=null; p.security=null;                  /* both were about the old build */
+      unverified=true;
       logActivity(p,"Builder","Auto-fix round "+it+": applied fixes for "+before+" bug(s).");
       upsertProject(p);
       onProgress("round "+it+"/"+MAX_ITER+" — executing");
@@ -1866,6 +2020,7 @@ function runAutoFixLoop(p, onProgress){
       return runQA(p);
     }).then(function(q){
       p.qa=q;
+      noteCandidate("round "+it);
       var after=(q.bugs||[]).length, sig=bugSig(q);
       p.autofix.rounds.push({ n:it, before:before, after:after, verdict:q.verdict||"?", runtime:runtimeLabel(p), tokens:tokSince(null, tokStart-1) });
       logActivity(p,"Supervisor/QA","Auto-fix round "+it+": "+before+" → "+after+" bug(s), verdict "+(q.verdict||"?")+".");
@@ -1878,7 +2033,11 @@ function runAutoFixLoop(p, onProgress){
       return round();
     });
   }
-  return round();
+  return round().catch(function(err){
+    /* a round broke halfway (QA/runner/model error): never leave the unverified build in place */
+    try{ if(unverified){ var m=restoreBest("round failed"); if(m){ logActivity(p,"Auto-fix",m.trim()); p.autofix.outcome="error"; upsertProject(p); } } }catch(_){}
+    throw err;
+  });
 }
 function stepAutoFix(id){
   var p=getProject(id); if(!p||!p.build) return;
@@ -2050,7 +2209,9 @@ function runSecurity(p){
   var files=(p.build&&p.build.files)||[]; var filesCtx="";
   if(isLargeApp(p)) filesCtx=keywordCtx(p, "password passcode pin token apikey api_key secret supabase fetch innerHTML outerHTML insertAdjacentHTML eval Function localStorage login auth role permission delete admin", 16000)
     +"\nNOTE: focused scan \u2014 only security-relevant sections of a large app are shown; say so in the summary and do not guess about unseen code.";
-  else for(var k=0;k<files.length;k++){ filesCtx+="=== "+files[k].path+" ===\n"+files[k].content+"\n"; }
+  /* Patch 39 (cost): like QA, Security gets the code without CSS, indentation and blank lines.
+     All HTML and <script> content stays, so every security-relevant line is still reviewed. */
+  else filesCtx=qaCodeCtx(files, false)+"\nNOTE: CSS, indentation and blank lines were removed to save tokens; cite findings by file and code snippet, not line number.";
   var depCtx;
   if(p.depAudit&&p.depAudit.configured){
     depCtx="DEPENDENCY AUDIT OUTPUT (npm audit):\n";
@@ -2161,6 +2322,8 @@ function wfStepObj(p,key){ for(var i=0;i<p.workflow.steps.length;i++){ if(p.work
 function wfLabel(w,key){ for(var i=0;i<w.steps.length;i++){ if(w.steps[i].key===key) return w.steps[i].label; } return key; }
 function classifyError(err){
   var st = err && err.status; var msg = (err && err.message) || "";
+  if(err && err.timedOut) return "The AI provider did not answer in time (busy or slow network). Nothing was changed. Tap Retry step; if it keeps happening, try again later or switch the model in Settings.";
+  if(/output truncated/i.test(msg) && err && err.fullGenCut) return "The app is too big for the model's output limit in one go (not retried, to save tokens). Build it in parts: keep only the core screens in the requirements (Edit), re-run the plan, then add the other features one at a time with Report bug. Retry step once only if the app is small.";
   if(/output truncated/i.test(msg)) return ((err&&err.agent)==="qa"?"QA":"Builder")+" output was cut off twice (the free model has a small output limit). Tap Resume/Retry once more; if it repeats, simplify the requirements or build the app in smaller modules and add features one at a time with Report bug.";
   /* Sandbox runner errors (checked first so they are not mistaken for model errors) */
   if(/sandbox runner unreachable/i.test(msg)) return "Runner unreachable — set ALLOWED_ORIGIN on Render exactly as shown above, confirm the service is Live, then Resume.";
@@ -2182,7 +2345,18 @@ function classifyError(err){
 }
 /* Any new build makes prior runtime results obsolete — clear them so
    QA/approval never treat an older build's execution as current proof. */
-function invalidateBuildArtifacts(p){ p.exec=null; p.depAudit=null; }
+/* Patch 37 (audit): QA and Security results describe the code they reviewed. Any replacement of the
+   code (Builder fix, Security fix, workflow Builder, import, AI Engineer, restore) now clears them too,
+   so a "QA passed" / "Security reviewed" can never be shown for code they did not see. */
+function saveRequirements(id){
+  var p=getProject(id); if(!p) return;
+  if(projectLocked(id)){ alert(lockMsg()); return; }
+  var el=document.getElementById("req_edit"); var v=el?String(el.value||"").trim():"";
+  if(!v){ alert("Requirements cannot be empty."); return; }
+  if(v!==p.description){ p.description=v; p.reqChanged=!!p.plan; p.sizeOk=false; logActivity(p,"You","Edited the requirements."+(p.plan?" Re-run the plan to apply them.":"")); upsertProject(p); }
+  state.reqEdit=null; render();
+}
+function invalidateBuildArtifacts(p){ p.exec=null; p.depAudit=null; p.qa=null; p.security=null; }
 /* Replace the build, but first checkpoint the PREVIOUS build so it can be
    restored. Never snapshots the new build as if it were the old one. */
 /* Patch 26 (audit P0-2): shrink guard. An automated Builder result that is much smaller than the
@@ -2300,8 +2474,28 @@ function startWorkflow(id){
   upsertProject(p);
   runWorkflowFrom(id, "design", false);
 }
+/* Patch 44: workflows started in THIS page session. A saved "running" workflow that is not in this
+   list was cut off (app closed, reloaded, or iPhone Safari unloaded the tab), so nothing can finish it. */
+var WF_LIVE={};
+function wfRecover(p){
+  var w=p&&p.workflow;
+  if(!w || !w.running || WF_LIVE[p.id] || isBusy("workflow")) return false;
+  var key=null;
+  for(var i=0;i<(w.steps||[]).length;i++){ if(w.steps[i].status==="running"){ key=w.steps[i].key; w.steps[i].status="failed"; break; } }
+  if(!key){ for(var j=0;j<(w.steps||[]).length;j++){ if(w.steps[j].status==="pending"){ key=w.steps[j].key; break; } } }
+  w.running=false;
+  if(key){
+    w.failedStep=key;
+    w.error="Interrupted: the app was closed or reloaded while this step was running. Nothing was lost; the last saved state is kept.";
+    w.errorHint="Tap Retry step to run this step again, or Resume workflow to continue from here. (If the workflow is still running in another open tab, close that tab first.)";
+  }
+  p.phase="Workflow interrupted"; logActivity(p,"Orchestrator","Workflow was interrupted (app closed or reloaded)"+(key?(" at "+key):"")+". Retry or Resume is available.");
+  upsertProject(p); return true;
+}
 function runWorkflowFrom(id, startKey, singleStep){
   var p=getProject(id); if(!p||!p.workflow) return;
+  WF_LIVE[id]=true;
+  setTimeout(function(){ if(state.busy.workflow) BUSY_FOR.workflow=id; }, 0);
   p.workflow.running=true; p.workflow.failedStep=null; p.workflow.error=null; p.workflow.errorHint=null; p.workflow.awaitingApproval=false;
   setBusy("workflow",true);
   var order = p.workflow.steps.map(function(s){ return s.key; });
@@ -2384,6 +2578,7 @@ function workflowPanel(p){
     h+= runBtn(w?"Re-run Workflow":"Run Workflow","startWorkflow('"+p.id+"')","workflow", !approved, "red");
   }
   h+='</div>';
+  if(isBusy("workflow") && BUSY_FOR.workflow && BUSY_FOR.workflow!==p.id){ var op=getProject(BUSY_FOR.workflow); h+='<p class="help" style="margin-top:8px">Another project'+(op?(' (<b>'+esc(op.name)+'</b>)'):'')+' is running its workflow. One workflow runs at a time to protect your token quota \u2014 wait for it to finish.</p>'; }
   if(!approved){ h+='<p class="help" style="margin-top:8px">Approve the plan (tab 1) to enable the workflow: Design &rarr; Builder &rarr; Execute &rarr; QA &rarr; Auto-fix &rarr; Security &rarr; Approval.</p></div>'; return h; }
   if(!w){ h+='<p class="help" style="margin-top:8px">Runs Design &rarr; Builder &rarr; Execute &rarr; QA &rarr; Auto-fix &rarr; Security in sequence (reusing the existing agents), then asks for your approval. A checkpoint is saved before any code is replaced.</p></div>'; return h; }
   h+='<div style="margin-top:12px;display:flex;flex-wrap:wrap;gap:8px">';
@@ -2417,7 +2612,7 @@ function stepPM(id){
   var p = getProject(id); if(!p) return;
   setBusy("pm",true); render();
   runPM(p).then(function(j){
-    p.plan = j; p.status="active"; p.phase="Planned";
+    p.plan = j; p.reqChanged=false; p.status="active"; p.phase="Planned";
     logActivity(p,"Project Manager","Created development plan ("+(j.tasks?j.tasks.length:0)+" tasks).");
     upsertProject(p); setBusy("pm",false); state.projectTab="plan"; render();
   }).catch(function(e){ setBusy("pm",false); alert(e.message); render(); });
@@ -2449,7 +2644,19 @@ function stepBuilder(id){
     upsertProject(p); setBusy("builder",false); state.projectTab="build"; render();
   }).catch(function(e){ setBusy("builder",false); alert(e.message); render(); });
 }
-function setBusy(k,v){ state.busy[k]=v; }
+/* Patch 47: run lock. Remember which project each running agent belongs to, so that project's
+   requirements cannot be edited and it cannot be deleted mid-run (the run saves its own copy of the
+   project when it finishes, which used to undo the edit or bring a deleted project back). */
+var BUSY_FOR={}, BUSY_GLOBAL={ pi:1, research:1 }, DELETED_IDS={};
+function setBusy(k,v){ state.busy[k]=v; if(v){ if(!BUSY_GLOBAL[k]) BUSY_FOR[k]=state.projectId||null; } else delete BUSY_FOR[k]; }
+function projectLocked(id){
+  var p=getProject(id);
+  if(p && p.workflow && p.workflow.running && WF_LIVE[id]) return true;
+  for(var k in state.busy){ if(state.busy[k] && !BUSY_GLOBAL[k] && BUSY_FOR[k]===id) return true; }
+  return false;
+}
+function lockMsg(){ return "An agent is still working on this project. Wait until it finishes (or, if it was interrupted, use Retry/Resume first), then try again \u2014 otherwise your change would be overwritten."; }
+function startReqEdit(id){ if(projectLocked(id)){ alert(lockMsg()); return; } state.reqEdit=id; render(); }
 function isBusy(k){ return !!state.busy[k]; }
 
 /* ---------- project CRUD ---------- */
@@ -2605,7 +2812,9 @@ function createProject(){
   state.view="project"; state.projectId=p.id; state.projectTab="plan"; render();
 }
 function deleteProject(id){
+  if(projectLocked(id)){ alert(lockMsg()); return; }
   if(!confirm("Delete this project? This cannot be undone.")) return;
+  DELETED_IDS[id]=true;
   var list = loadProjects().filter(function(x){ return x.id!==id; });
   saveProjects(list); cloudDelete(id); state.view="projects"; state.projectId=null; render();
 }
@@ -3495,7 +3704,7 @@ function appsIndexHtml(c){
   for(var i=0;i<list.length;i++){
     var d=list[i].deploys&&list[i].deploys[0];
     if(!d || d.repo!==(c.owner+"/"+c.repo)) continue;
-    rows+='<a class="app" href="'+esc(d.url)+'"><span class="ic">'+esc(appInitials(list[i].name))+'</span><span><b>'+esc(list[i].name)+'</b><br><small>'+esc(d.version||"")+' \u00b7 '+esc(String(d.date||"").slice(0,10))+'</small></span></a>';
+    rows+='<a class="app" href="'+esc(safeUrl(d.url)||"#")+'"><span class="ic">'+esc(appInitials(list[i].name))+'</span><span><b>'+esc(list[i].name)+'</b><br><small>'+esc(d.version||"")+' \u00b7 '+esc(String(d.date||"").slice(0,10))+'</small></span></a>';
   }
   return "<!DOCTYPE html>"+INDEX_MARK+'<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Apps</title>'
     +"<style>*,*::before,*::after{box-sizing:border-box}body{margin:0;font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:#f4f6f9;color:#0f2a4a;padding:24px 16px}"
@@ -3543,6 +3752,84 @@ function stepRollback(id, ix){
   }).catch(function(e){ logActivity(p,"Deploy","Rollback failed: "+e.message); upsertProject(p); setBusy("deploy",false); render(); alert(e.message); });
 }
 function setDepOpt(id, key, val){ var p=getProject(id); if(!p) return; if(!p.deployOpts) p.deployOpts={}; p.deployOpts[key]=!!val; upsertProject(p); render(); }
+/* ---------- Patch 42: pre-publish secret scan ----------
+   Published apps are public. Before any upload, every text file of the deploy payload is checked for
+   real credentials. High-confidence matches BLOCK the deploy (nothing is uploaded); the report shows
+   file, line and a masked hint only, never the value. A Supabase anon key is allowed (it is public by
+   design); a service_role key is blocked. Weaker signals (hard-coded passwords) only warn. */
+var SECRET_RULES=[
+  { name:"Groq API key", re:/gsk_[A-Za-z0-9]{20,}/g },
+  { name:"Anthropic API key", re:/sk-ant-[A-Za-z0-9_\-]{20,}/g },
+  { name:"OpenAI-style API key", re:/\bsk-(?:proj-)?[A-Za-z0-9_\-]{20,}/g },
+  { name:"Google API key", re:/AIza[0-9A-Za-z_\-]{35}/g },
+  { name:"GitHub token", re:/\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{40,}/g },
+  { name:"Tavily API key", re:/tvly-[A-Za-z0-9_\-]{16,}/g },
+  { name:"AWS access key", re:/\bAKIA[0-9A-Z]{16}\b/g },
+  { name:"Slack token", re:/\bxox[baprs]-[A-Za-z0-9\-]{10,}/g },
+  { name:"Private key", re:/-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----/g }
+];
+function jwtRole(tok){
+  try{ var part=String(tok).split(".")[1]; part=part.replace(/-/g,"+").replace(/_/g,"/"); while(part.length%4) part+="=";
+       var o=JSON.parse(atob(part)); return (o && o.role) ? String(o.role) : ""; }catch(e){ return ""; }
+}
+function secretScanPayload(payload){
+  var block=[], warn=[], s=getSettings(), gh=ghCfg();
+  var own=[["your AI API key",s.apiKey],["your Gemini key",s.geminiKey],["your sandbox secret",s.sandboxSecret],["your Tavily key",s.tavilyKey],["your GitHub token",gh.token]]
+    .filter(function(x){ return String(x[1]||"").length>=8; });
+  function lineOf(txt, idx){ return txt.slice(0, idx).split("\n").length; }
+  function mask(v){ v=String(v); return v.slice(0,4)+"\u2026("+v.length+" chars)"; }
+  (payload||[]).forEach(function(f){
+    if(f.b64) return;
+    var txt=String(f.content||""), m;
+    own.forEach(function(o){ var at=txt.indexOf(String(o[1])); if(at>=0) block.push(f.path+" line "+lineOf(txt,at)+": "+o[0]+" ("+mask(o[1])+")"); });
+    SECRET_RULES.forEach(function(r){ r.re.lastIndex=0; while((m=r.re.exec(txt))){ block.push(f.path+" line "+lineOf(txt,m.index)+": "+r.name+" ("+mask(m[0])+")"); } });
+    var jre=/eyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}/g;
+    while((m=jre.exec(txt))){ var role=jwtRole(m[0]); if(role==="service_role") block.push(f.path+" line "+lineOf(txt,m.index)+": Supabase service_role key ("+mask(m[0])+") \u2014 never publish this key"); }
+    var pre=/\b(?:password|passwd|pwd|secret)\s*[:=]\s*["'][^"'\s]{4,}["']/gi;
+    while((m=pre.exec(txt))){ warn.push(f.path+" line "+lineOf(txt,m.index)+": hard-coded "+m[0].split(/[:=]/)[0].trim()+" value"); }
+  });
+  var seen={}; block=block.filter(function(x){ if(seen[x]) return false; seen[x]=1; return true; });
+  return { block:block.slice(0,20), warn:warn.slice(0,10) };
+}
+/* ---------- Patch 43: post-deploy live check ----------
+   "Published" used to mean "GitHub accepted the files". Now the factory also opens the public page
+   (GitHub Pages allows this cross-origin) and compares its aiaf-version tag with the version just
+   published: Live (matches), Pending (old version or not built yet), Not live (404 / unreachable). */
+function liveCheckOnce(url, label){
+  var u=url+(url.indexOf("?")<0?"?":"&")+"aiaf_check="+Date.now();
+  return fetch(u, { cache:"no-store" }).then(function(res){
+    if(res.status===404) return { state:"down", detail:"404 \u2014 page not found yet" };
+    if(!res.ok) return { state:"pending", detail:"HTTP "+res.status };
+    return res.text().then(function(t){
+      var m=t.match(/<meta name="aiaf-version" content="([^"]*)"/i);
+      var got=m?m[1].replace(/&middot;|&#183;/g,"\u00b7"):"";
+      var want=String(label||"").replace(/&middot;|&#183;/g,"\u00b7");
+      if(got && want && got===want) return { state:"live", detail:"version "+got };
+      return { state:"pending", detail:got?("still serving "+got):"version tag not found yet" };
+    });
+  }, function(e){ return { state:"unknown", detail:"could not open the page from here ("+((e&&e.message)||"network")+")" }; });
+}
+function liveCheck(id, date, tries){
+  var p=getProject(id); if(!p||!p.deploys) return;
+  var rec=null; for(var i=0;i<p.deploys.length;i++){ if(p.deploys[i].date===date){ rec=p.deploys[i]; break; } }
+  if(!rec || !rec.verLabel) return;
+  rec.live="checking"; upsertProject(p); if(state.projectId===id) render();
+  liveCheckOnce(rec.url, rec.verLabel).then(function(r){
+    var p2=getProject(id); if(!p2||!p2.deploys) return;
+    var r2=null; for(var k=0;k<p2.deploys.length;k++){ if(p2.deploys[k].date===date){ r2=p2.deploys[k]; break; } }
+    if(!r2) return;
+    r2.live=r.state; r2.liveDetail=r.detail; r2.liveAt=new Date().toISOString();
+    if(r.state==="live") logActivity(p2,"Deploy","Live check: "+r2.version+" is live at "+r2.url+".");
+    upsertProject(p2); if(state.projectId===id) render();
+    if(r.state!=="live" && tries>1) setTimeout(function(){ liveCheck(id, date, tries-1); }, 30000);
+    else if(r.state!=="live") logActivity(p2,"Deploy","Live check: "+r2.version+" not confirmed yet ("+r.detail+"). Tap Check again later.");
+  });
+}
+function liveBadge(r){
+  if(!r || r.kind==="rollback" || !r.verLabel) return "";
+  var m={ live:['b-active','Live \u2713'], pending:['b-phase','Pending'], down:['b-blocked','Not live \u2717'], unknown:['b-idle','Not checked'], checking:['b-idle','Checking\u2026'] }[r.live||"unknown"];
+  return ' <span class="badge '+m[0]+'">'+m[1]+'</span>'+(r.liveDetail?(' <span class="muted">'+esc(r.liveDetail)+'</span>'):'');
+}
 function stepDeploy(id){
   var p=getProject(id); if(!p||!p.build||!p.build.files||!p.build.files.length){ alert("Generate code first."); return; }
   var c=ghCfg();
@@ -3567,13 +3854,25 @@ function stepDeploy(id){
   var verLabel=ver+" \u00b7 "+d0.getDate()+" "+MON[d0.getMonth()]+" "+d0.getFullYear();
   var payload, cm="AI App Factory deploy: "+p.name+" "+ver;
   try{ payload=deployPayload(p, ver+"-"+d0.getTime(), verLabel); }catch(e0){ setBusy("deploy",false); render(); alert(e0.message); return; }
+  var scan=secretScanPayload(payload);
+  if(scan.block.length){
+    setBusy("deploy",false);
+    logActivity(p,"Deploy","Blocked by the secret scan before upload ("+scan.block.length+" finding(s)). Nothing was published.");
+    auditEvent("deployed", p, { gate:"secret-scan", version:ver, ok:false, flagged:true, error:"secret scan: "+scan.block.length+" finding(s)", note:"Deploy blocked: "+scan.block.join("; ") });
+    upsertProject(p); render();
+    alert("Deploy BLOCKED — the app's code contains secrets that would become public:\n\n\u2022 "+scan.block.join("\n\u2022 ")+"\n\nNothing was uploaded. Remove the key from the code (Report bug or AI Engineer: \"remove the hard-coded key\") and deploy again.");
+    return;
+  }
+  if(scan.warn.length && !confirm("Secret scan warning:\n\n\u2022 "+scan.warn.join("\n\u2022 ")+"\n\nA hard-coded password in a public app can be read by anyone. Publish anyway?")){
+    setBusy("deploy",false); logActivity(p,"Deploy","Cancelled after the secret-scan warning."); upsertProject(p); render(); return;
+  }
   var opts=depOpts(p), idxNote="";
   uploadAll(c, slug, payload, cm).then(function(done){
     return ghEnsurePages(c).then(function(pg){
       var rec={ kind:"deploy", at:nowStr(), date:d0.toISOString(), url:pagesUrl(c, slug), files:done.length, version:ver,
                 commit:(done.length?done[done.length-1].commit:"").slice(0,7),
                 fileCommits:done.map(function(d){ return { path:d.path, commit:d.commit }; }),
-                repo:c.owner+"/"+c.repo, warnings:w, pages:pg.enabled, pwa:opts.pwa };
+                repo:c.owner+"/"+c.repo, warnings:w, pages:pg.enabled, pwa:opts.pwa, verLabel:verLabel, live:"unknown" };
       if(!p.deploys) p.deploys=[];
       p.deploys.unshift(rec); if(p.deploys.length>20) p.deploys.length=20;
       upsertProject(p);
@@ -3588,6 +3887,7 @@ function stepDeploy(id){
     auditEvent("deployed", p, { gate:"deploy", version:rec.version, url:rec.url, commit:rec.commit, flagged:w.length>0,
       note:"Published "+rec.version+" to "+rec.url+(w.length?(". Warnings: "+w.join("; ")):"") });
     upsertProject(p); setBusy("deploy",false); render();
+    var did=rec.date; setTimeout(function(){ liveCheck(p.id, did, 5); }, 20000);
   }).catch(function(e){
     var dn=(e&&e.done)?e.done.length:0;
     logActivity(p,"Deploy",dn?("Stopped after "+dn+" of "+payload.length+" file(s): "+e.message):("Failed: "+e.message));
@@ -3634,11 +3934,11 @@ function tabDeploy(p, approved){
     h+='<div class="divider"></div><b class="small">Deploy history</b>';
     for(var i=0;i<d.length;i++){
       var r=d[i];
-      h+='<div class="small" style="padding:6px 0;border-bottom:1px solid var(--line)">'+(r.version?('<b>'+esc(r.version)+'</b> '+(r.kind==="rollback"?'(rollback) ':'')):'')+esc(r.at)+' \u00b7 '+esc(r.files)+' file(s)'
+      h+='<div class="small" style="padding:6px 0;border-bottom:1px solid var(--line)">'+(r.version?('<b>'+esc(r.version)+'</b> '+(r.kind==="rollback"?'(rollback) ':'')):'')+(r.date?esc(govWhen(r.date)):esc(r.at))+liveBadge(r)+' \u00b7 '+esc(r.files)+' file(s)'
         +(r.commit?(' \u00b7 commit '+esc(r.commit)):'')+(r.warnings&&r.warnings.length?(' \u00b7 '+esc(r.warnings.length)+' warning(s)'):'')
-        +'<br><a href="'+esc(r.url)+'" target="_blank" rel="noopener">'+esc(r.url)+'</a>'
+        +'<br>'+(safeUrl(r.url)?('<a href="'+esc(safeUrl(r.url))+'" target="_blank" rel="noopener">'+esc(r.url)+'</a>'):esc(r.url))
         +(i===0 && r.pages===false?'<br><span class="muted">Turn on GitHub Pages once: repo \u2192 Settings \u2192 Pages \u2192 Branch: '+esc(c.branch)+' / root \u2192 Save.</span>':'')
-        +(i===0?'<br><span class="muted">A new deploy can take 1\u20132 minutes to appear.</span>':'')
+        +(i===0?'<br><span class="muted">A new deploy can take 1\u20132 minutes to appear.</span>'+(r.verLabel && r.live!=="live" && r.live!=="checking"?' <button class="btn ghost sm" onclick="liveCheck(\''+p.id+'\',\''+esc(r.date)+'\',1)">Check again</button>':''):'')
         +(i>0 && r.kind!=="rollback" && r.fileCommits && r.fileCommits.length?('<br><button class="btn ghost sm" style="margin-top:6px"'+(isBusy("deploy")?' disabled':'')+' onclick="stepRollback(\''+p.id+'\','+i+')">Roll back to '+esc(r.version||"this")+'</button>'):'')+'</div>';
     }
   }
@@ -4459,9 +4759,42 @@ function ptab(key,label){
   var a = state.projectTab===key ? " active" : "";
   return '<button class="tab'+a+'" onclick="setTab(\''+key+'\')">'+label+'</button>';
 }
+/* Patch 45: "Next step" — one line, from the real project state, no AI call. The button only opens
+   the right tab; it never runs an agent, approves or deploys by itself. */
+function nextStep(p){
+  var w=p.workflow, approved=p.approvals&&p.approvals.plan;
+  if(w && w.running) return { t:"Wait: the workflow is running ("+esc(p.phase||"")+").", tab:null };
+  if(!p.plan) return { t:"Run the Project Manager to turn the requirements into a plan.", tab:"plan", b:"Open Plan" };
+  if(p.reqChanged) return { t:"Requirements changed after the plan was made \u2014 re-run the plan so it matches.", tab:"plan", b:"Open Plan" };
+  if(!approved) return { t:"Review the plan and approve it (human checkpoint).", tab:"plan", b:"Open Plan" };
+  if(w && w.failedStep) return { t:"Fix the failed step: <b>"+esc(wfLabel(w,w.failedStep))+"</b> \u2014 "+esc(String(w.error||"").slice(0,140))+". Then Retry step or Resume (in the workflow card above).", tab:null };
+  if(!p.build) return { t:"Generate the code: tap Run Workflow above (Design \u2192 Builder \u2192 tests).", tab:null };
+  var ob=openUserBugs(p).length;
+  if(ob) return { t:ob+" bug(s) you reported are still open \u2014 test them in Preview and confirm, or let the Builder fix them.", tab:"qa", b:"Open QA" };
+  if(!p.qa) return { t:"The current code has no QA result \u2014 run QA.", tab:"qa", b:"Open QA" };
+  if(p.qa.verdict!=="pass") return { t:"QA found "+((p.qa.bugs||[]).length)+" issue(s) \u2014 run Auto-fix or fix them, then re-run QA.", tab:"qa", b:"Open QA" };
+  var ui=(p.qa.ui&&p.qa.ui.errors)||0;
+  if(ui) return { t:ui+" browser test(s) could not run \u2014 check those features yourself in Preview.", tab:"build", b:"Open Build" };
+  if(!p.security) return { t:"Run the Security review on the current code.", tab:"security", b:"Open Security" };
+  if(p.security.risk_rating==="critical"||p.security.risk_rating==="high") return { t:"Security risk is "+esc(String(p.security.risk_rating).toUpperCase())+" \u2014 fix it before publishing.", tab:"security", b:"Open Security" };
+  if(w && w.awaitingApproval) return { t:"All steps are done \u2014 review QA and Security, then approve in the workflow card above.", tab:null };
+  var d=(p.deploys||[])[0];
+  if(!d) return { t:"Ready to publish. Deploy when you are satisfied (you confirm every publish).", tab:"deploy", b:"Open Deploy" };
+  if(d.kind!=="rollback" && d.verLabel && d.live!=="live") return { t:"Latest deploy "+esc(d.version||"")+" is not confirmed live yet \u2014 Check again in the Deploy tab.", tab:"deploy", b:"Open Deploy" };
+  if(p.status!=="completed") return { t:"Published and checked. Mark the project complete when users have tried it.", tab:"qa", b:"Open QA" };
+  return { t:"Done. Report a bug or edit the requirements to start the next change.", tab:null };
+}
+function nextStepHtml(p){
+  try{
+    var n=nextStep(p);
+    return '<div class="callout info" style="margin:12px 0 0"><b>Next step:</b> '+n.t
+      +(n.tab?(' <button class="btn ghost sm" style="margin-left:6px" onclick="setTab(\''+n.tab+'\')">'+n.b+'</button>'):'')+'</div>';
+  }catch(e){ return ""; }
+}
 function renderProject(){
   var p = getProject(state.projectId);
   if(!p){ return renderProjects(); }
+  if(wfRecover(p)) p=getProject(state.projectId);
   var approved = p.approvals && p.approvals.plan;
   var h = '<div class="page"><div class="wrap">';
   h += '<div class="flex-between"><div><h1 class="h1">'+esc(p.name)+' '+statusBadge(p.status)+'</h1>'
@@ -4469,7 +4802,18 @@ function renderProject(){
      + '<div><button class="btn ghost sm" onclick="go(\'projects\')">&larr; All projects</button> '
      + '<button class="btn ghost sm" onclick="deleteProject(\''+p.id+'\')">Delete</button></div></div>';
 
-  h += '<div class="card p" style="margin-bottom:14px"><b>Requirements</b><p class="small" style="margin:8px 0 0">'+esc(p.description)+'</p></div>';
+  /* Patch 37: the PM asks you to "answer by editing requirements & re-running", so requirements are editable. */
+  if(state.reqEdit===p.id){
+    h += '<div class="card p" style="margin-bottom:14px"><b>Requirements</b>'
+      +'<textarea id="req_edit" style="margin-top:8px;min-height:180px">'+esc(p.description)+'</textarea>'
+      +'<div style="margin-top:8px;display:flex;gap:8px"><button class="btn sm" onclick="saveRequirements(\''+p.id+'\')">Save</button>'
+      +'<button class="btn ghost sm" onclick="state.reqEdit=null;render()">Cancel</button></div></div>';
+  } else {
+    h += '<div class="card p" style="margin-bottom:14px"><div class="flex-between"><b>Requirements</b>'
+      +'<button class="btn ghost sm" onclick="startReqEdit(\''+p.id+'\')">Edit</button></div>'
+      +'<p class="small" style="margin:8px 0 0;white-space:pre-wrap">'+esc(p.description)+'</p>'
+      +(p.reqChanged&&p.plan?'<div class="callout warn" style="margin:8px 0 0">Requirements changed after the plan was made. Tap <b>Re-run plan</b> (tab 1 \u00b7 Plan) so the plan matches.</div>':'')+'</div>';
+  }
 
   /* development monitor */
   h += '<div class="grid grid-2" style="margin-bottom:14px">';
@@ -4483,8 +4827,8 @@ function renderProject(){
      + '<span class="kk">QA verdict</span><span>'+(p.qa?esc(p.qa.verdict||"?"):'<span class="badge b-idle">pending</span>')+'</span>'
      + '<span class="kk">Fix iterations</span><span>'+((p.iteration||0))+'/'+MAX_ITER+'</span>'
      + '<span class="kk">Security risk</span><span>'+(p.security?esc(p.security.risk_rating||"?"):'<span class="badge b-idle">pending</span>')+'</span>'
-     + '</div></div>';
-  var act='<div class="card p"><b>Activity</b><div class="activity" style="margin-top:8px">';
+     + '</div>'+nextStepHtml(p)+'</div>';
+  var act='<div class="card p"><div class="flex-between"><b>Activity</b><button class="btn ghost sm" onclick="exportDiagnostics(\''+p.id+'\')">'+engL("Export diagnostics","Dhoofi warbixinta")+'</button></div><div class="activity" style="margin-top:8px">';
   var pa=p.activity||[];
   if(pa.length===0) act+='<div class="small muted">No activity.</div>';
   for(var i=0;i<pa.length;i++){ act+='<div class="a"><span class="at">'+esc(pa[i].t)+'</span><span><b>'+esc(pa[i].agent)+'</b> · '+esc(pa[i].msg)+'</span></div>'; }
@@ -4726,7 +5070,11 @@ function tabQA(p, approved){
       } else if(p.status==="completed"){
         h+='<div class="callout ok">\u2713 Project complete. QA passed and all your reported bugs are fixed.</div>';
       } else {
-        h+='<div class="callout ok">QA passed with no bugs. You can mark this project complete.</div><button class="btn" onclick="markComplete(\''+p.id+'\')">Mark complete</button>';
+        var uiErr=(p.qa&&p.qa.ui&&p.qa.ui.errors)||0;
+        h+=(uiErr
+          ? '<div class="callout warn">QA passed, but <b>'+uiErr+' browser test(s) could not run</b>, so those features were NOT tested. Check them in Preview before completing.</div>'
+          : '<div class="callout ok">QA passed with no bugs. You can mark this project complete.</div>')
+          +'<button class="btn" onclick="markComplete(\''+p.id+'\')">Mark complete</button>';
       }
     }
   } else {
@@ -4739,7 +5087,10 @@ function tabQA(p, approved){
     h+='<div class="divider"></div><b>Version checkpoints</b> <span class="help">(snapshots of generated code — restore any version)</span>';
     for(var c=0;c<p.buildHistory.length;c++){
       var sn=p.buildHistory[c];
-      h+='<div class="flex-between" style="padding:7px 0;border-bottom:1px solid var(--line)"><span class="small">v'+esc(sn.v)+' · '+esc(sn.ts)+' · '+esc(sn.note)+'</span><button class="btn ghost sm" onclick="rollbackBuild(\''+p.id+'\','+c+')">Restore</button></div>';
+      if(c===0){ var lgIx=-1; for(var g=0;g<p.buildHistory.length;g++){ if(snapIsGood(p.buildHistory[g].quality)){ lgIx=g; break; } } }
+      h+='<div class="flex-between" style="padding:7px 0;border-bottom:1px solid var(--line)"><span class="small">v'+esc(sn.v)+' · '+esc(sn.at?govWhen(sn.at):sn.ts)+' · '+esc(sn.note)
+        +(c===lgIx?' <span class="badge b-active">\u2b50 last good</span>':'')
+        +'<br><span class="muted">'+esc(snapQualityText(sn.quality))+'</span></span><button class="btn ghost sm" onclick="rollbackBuild(\''+p.id+'\','+c+')">Restore</button></div>';
     }
   }
   h+='</div>';
@@ -4814,8 +5165,8 @@ function tavilySearch(q){
   var s=getSettings(), k=String(s.tavilyKey||"").trim();
   var headers={ "Content-Type":"application/json" };
   if(k) headers.Authorization="Bearer "+k; else headers["X-Tavily-Access-Mode"]="keyless";
-  return fetch("https://api.tavily.com/search", { method:"POST", headers:headers,
-    body:JSON.stringify({ query:q, search_depth:"basic", max_results:5, time_range:"month" }) })
+  return fetchT("https://api.tavily.com/search", { method:"POST", headers:headers,
+    body:JSON.stringify({ query:q, search_depth:"basic", max_results:5, time_range:"month" }) }, 60000, "Tavily search")
   .then(function(res){ return res.text().then(function(raw){
     if(!res.ok){ var e=new Error("Web search error ("+res.status+"): "+String(raw||"").slice(0,160)); e.status=res.status; throw e; }
     var d; try{ d=JSON.parse(raw); }catch(x){ throw new Error("Bad response from the web search."); }
@@ -4841,11 +5192,11 @@ function groqSearch(q, _retried){
      each url is checked against the browsing log (executed_tools) so invented links are marked. */
   var s=getSettings();
   if(!/groq\.com/i.test(String(s.baseUrl||""))||!s.apiKey) return Promise.reject(new Error(engL("Research web search needs Groq as the main provider (key set in Settings).","Raadinta Research waxay u baahan tahay Groq oo ah bixiyaha weyn (key ku jira Settings).")));
-  return fetch(String(s.baseUrl).replace(/\/+$/,"")+"/chat/completions", { method:"POST",
+  return fetchT(String(s.baseUrl).replace(/\/+$/,"")+"/chat/completions", { method:"POST",
     headers:{ "Content-Type":"application/json", "Authorization":"Bearer "+s.apiKey },
     body:JSON.stringify({ model:s.researchSearchModel||"openai/gpt-oss-20b", tool_choice:"required", tools:[{ type:"browser_search" }],
       reasoning_effort:"low", max_completion_tokens:1500, temperature:0.3,
-      messages:[{ role:"system", content:"Use browser search. Then reply with ONLY a JSON array (no markdown) of up to 8 RECENT results you actually opened or saw: [{\"title\":\"\",\"url\":\"\",\"snippet\":\"one or two factual sentences\"}]. Copy each url exactly. Never invent a url." },{ role:"user", content:q }] }) })
+      messages:[{ role:"system", content:"Use browser search. Then reply with ONLY a JSON array (no markdown) of up to 8 RECENT results you actually opened or saw: [{\"title\":\"\",\"url\":\"\",\"snippet\":\"one or two factual sentences\"}]. Copy each url exactly. Never invent a url." },{ role:"user", content:q }] }) }, 90000, "Groq search")
   .then(function(res){ return res.text().then(function(raw){
     var isDaily=/per d(ay)?\b|tokens per day|TPD|RPD/i.test(String(raw||""));
     if(res.status===429 && isDaily){ var ed=new Error(engL("Groq's DAILY free limit for ","Xadka bilaashka ah ee MAALINLAHA ah ee Groq ee ")+(s.researchSearchModel||"openai/gpt-oss-20b")+engL(" is used up. Try Research again tomorrow (you can still tap Verify).",engL(""," waa dhammaaday. Research mar kale isku day berri (Verify weli waad riixi kartaa)."))); ed.status=429; ed.daily=true; throw ed; }
@@ -4971,11 +5322,11 @@ function researchCard(){
           +(v.limitation?('<br><b>'+engL("Limitation: ","Xaddidaad: ")+'</b>'+esc(v.limitation)):'')
           +(v.risk?('<br><b>'+engL("Risk: ","Khatar: ")+'</b>'+esc(v.risk)):'')
           +(recTxt?('<br><b>'+engL("Recommendation: ","Talo: ")+'</b>'+esc(recTxt)):'')+'</div>'):'')
-        +'<div class="small" style="margin-top:6px;word-break:break-all"><a href="'+esc(x.url)+'" target="_blank" rel="noopener noreferrer">'+esc(x.url)+'</a></div></div>';
+        +'<div class="small" style="margin-top:6px;word-break:break-all"><'+(safeUrl(x.url)?'a href="'+esc(safeUrl(x.url))+'" target="_blank" rel="noopener noreferrer"':'span')+'>'+esc(x.url)+'</'+(safeUrl(x.url)?'a':'span')+'></div></div>';
     });
     if(R.sources&&R.sources.length){
       h+='<div class="small muted" style="margin-top:10px">'+engL("Pages the web search actually returned:","Bogagga raadintu runtii soo celisay:")+'</div><ul class="small" style="margin:4px 0 0 18px;padding:0">';
-      R.sources.forEach(function(s2){ h+='<li><a href="'+esc(s2.uri)+'" target="_blank" rel="noopener noreferrer">'+esc(s2.title)+'</a></li>'; });
+      R.sources.forEach(function(s2){ h+='<li>'+(safeUrl(s2.uri)?('<a href="'+esc(safeUrl(s2.uri))+'" target="_blank" rel="noopener noreferrer">'+esc(s2.title)+'</a>'):esc(s2.title))+'</li>'; });
       h+='</ul>';
     }
     h+='<div class="help" style="margin-top:8px">'+engL("Checked by the Verifier against the search snippet and your constraints (free tier, no card, Somaliland). VERIFIED still means: test it yourself before adopting.","Verifier-ka ayaa ku hubiyay qoraalka raadinta iyo xaaladdaada (bilaash, kaar la'aan, Somaliland). VERIFIED weli macnaheedu waa: adigu tijaabi kahor intaadan qaadan.")+'</div>';
@@ -5227,7 +5578,8 @@ function specSync(rows){
 function cloudPull(){
   if(!cloud.client || !cloud.user) return Promise.resolve();
   cloudSetStatus("syncing","Downloading");
-  return cloud.client.from("aiaf_projects").select("id,data,deleted,updated_at").then(function(res){
+  /* Patch 46: also filter by owner (defense in depth; RLS should already do this). */
+  return cloud.client.from("aiaf_projects").select("id,data,deleted,updated_at").eq("owner", cloud.user.id).then(function(res){
     if(res.error) throw res.error;
     var allRows=res.data||[], specRows=allRows.filter(function(r){ return r&&SPECIAL_ROWS[r.id]; });
     try{ specSync(specRows); }catch(e){}
